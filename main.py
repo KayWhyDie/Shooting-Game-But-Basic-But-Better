@@ -11,23 +11,40 @@ FPS = 144
 # runtime screen size (updates when toggling fullscreen)
 screen_w, screen_h = WINDOWED_DEFAULT
 
-from game_core import Cover, Crate, Particle, Grenade, Bullet, Soldier, set_screen_size, set_frame_scale
+from game_core import Cover, Crate, Particle, Grenade, Bullet, Soldier, set_screen_size, set_frame_scale, _line_blocked_by_covers
 from concurrent.futures import ThreadPoolExecutor
+from helpers import play_sound_obj, spawn_explosion, make_roguelike_covers, make_team
+from debug_tools import spawn_pawn, spawn_bomb_carrier_sandbox, give_bomb_to_random_team, clear_entities
+from bomb import draw_bomb, drop_bomb_at, reset_round_bomb
+from ui import draw_hud
 
 # Main
 def main():
     global screen_w, screen_h
+    # request a Windows audio backend before initializing SDL so mixer chooses the right driver
+    try:
+        os.environ['SDL_AUDIODRIVER'] = 'directsound'
+    except Exception:
+        pass
     pygame.init()
-    os.environ['SDL_AUDIODRIVER'] = 'directsound'
+    # Ensure mixer is initialized for sound playback; safe-guard for systems where audio backend failed
+    try:
+        pygame.mixer.init()
+    except Exception:
+        print('Warning: pygame.mixer failed to initialize; sounds may not play')
+    # increase mixer channels so multiple gunshots can overlap without cutting previous ones
+    try:
+        pygame.mixer.set_num_channels(32)
+    except Exception:
+        pass
     info = pygame.display.Info()
-    # start in fullscreen at the current display resolution, with a smaller windowed fallback
+    # start windowed by default to avoid aggressive fullscreen/alt-tab behavior
     windowed_size = WINDOWED_DEFAULT
-    start_full = (info.current_w, info.current_h)
-    screen = pygame.display.set_mode(start_full, pygame.FULLSCREEN)
-    screen_w, screen_h = start_full
+    screen_w, screen_h = windowed_size
+    screen = pygame.display.set_mode(windowed_size, pygame.RESIZABLE)
     set_screen_size(screen_w, screen_h)
     pygame.display.set_caption("2D Asker Savaşı - Gelişmiş")
-    fullscreen = True
+    fullscreen = False
     clock = pygame.time.Clock()
     # thread pool for light-weight parallel updates
     executor = ThreadPoolExecutor(max_workers=max(2, (os.cpu_count() or 2) - 1))
@@ -47,12 +64,29 @@ def main():
     sounds['ak47'] = load_sound_prefer_source('ak47.mp3')
     sounds['m4a1'] = load_sound_prefer_source('m4a1.mp3')
     sounds['damage'] = load_sound_prefer_source('damage.mp3')
+    # set defaults for sound volumes where loaded
+    try:
+        if sounds.get('m4a1'): sounds['m4a1'].set_volume(0.7)
+        if sounds.get('ak47'): sounds['ak47'].set_volume(0.7)
+        if sounds.get('explosion'): sounds['explosion'].set_volume(0.8)
+    except Exception:
+        pass
+
+    # the play_sound_obj helper is provided by helpers.py and imported at module top
+
+    # ensure game_core uses the same play helper so AI sound plays are logged and channel-aware
+    try:
+        import game_core as _gc
+        _gc.play_sound_local = lambda s: play_sound_obj(s, sounds)
+    except Exception:
+        pass
 
     # load sprites
     sprite_red = load_image_prefer_source('red.png')
     sprite_green = load_image_prefer_source('green.png')
     weapon_ak = load_image_prefer_source('ak47.png')
     weapon_m4 = load_image_prefer_source('m4a1.png')
+    bomb_img = load_image_prefer_source('bomb.png')
     # load explosion frames and generic images. Support files in source/ and source/explosion/
     explosion_frames = []
     generic_images = []
@@ -81,6 +115,13 @@ def main():
                     continue
                 if lf.startswith('generic'):
                     generic_candidates.append(path)
+                # log missing expected sounds for easier debugging
+            # debug: print sound load status (helps track missing sounds like m4a1)
+            try:
+                for k in list(sounds.keys()):
+                    print(f"Sound '{k}': {'loaded' if sounds.get(k) else 'missing'}")
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -105,54 +146,13 @@ def main():
         if img is not None:
             generic_images.append(img)
 
-    # helper to spawn an explosion animation + image-particles at (x,y)
-    def spawn_explosion(x, y, magnitude=1.0):
-        # magnitude may be used to scale particle count / camera shake elsewhere
-        if explosion_frames:
-            # faster animation: smaller tick value and use frame_scale to advance
-            explosion_anims.append({'x': x + random.uniform(-4, 4), 'y': y + random.uniform(-4, 4), 'frame': 0, 'tick': 2.0})
-        if generic_images:
-            # spawn more particles for real explosions; randomized count (8-15)
-            for _ in range(random.randint(8, 15)):
-                img = random.choice(generic_images)
-                ip = {
-                    'img': img,
-                    'x': x + random.uniform(-12 * magnitude, 12 * magnitude),
-                    'y': y + random.uniform(-12 * magnitude, 12 * magnitude),
-                    'vx': random.uniform(-3, 3),
-                    'vy': random.uniform(-3, 3),
-                    'life': random.randint(24, 90),
-                    'rot': random.uniform(0, 360),
-                    'rot_speed': random.uniform(-6, 6),
-                    'scale': random.uniform(0.3, 1.2)
-                }
-                image_particles.append(ip)
+    # spawn_explosion helper is provided by helpers.py; call with resource lists where used
 
-    # helper to create teams (used in both modes)
-    def make_team(xmin, xmax, color, n=5):
-        roles = ['rifle','rifle','grenadier','medic','heavy']
-        team = []
-        for i in range(n):
-            role = random.choice(roles)
-            s = Soldier(random.randint(xmin,xmax), random.randint(50,screen_h-50), color, role=role)
-            # assign sprites based on color (red/blue)
-            if color == (255,0,0):
-                s.sprite = sprite_red
-            else:
-                s.sprite = sprite_green
-            # weapon images and sounds per role
-            if role == 'heavy' or role == 'grenadier':
-                s.weapon_img = weapon_ak
-                s.weapon_sound = sounds.get('ak47') or sounds.get('shoot_red')
-            else:
-                s.weapon_img = weapon_m4
-                s.weapon_sound = sounds.get('m4a1') or (sounds.get('shoot_blue') if color==(0,0,255) else sounds.get('shoot_red'))
-            team.append(s)
-        return team
+    # team and cover helpers are provided by helpers.py (make_team, make_roguelike_covers)
 
     # Menu state
-    mode = 'menu'  # 'menu', 'play', 'simulation'
-    menu_options = ['Play', 'Simulation']
+    mode = 'menu'  # 'menu', 'play', 'simulation', 'sandbox'
+    menu_options = ['Play', 'Simulation', 'Sandbox']
     menu_idx = 0
 
     bullets = []
@@ -162,6 +162,7 @@ def main():
     image_particles = []
     crates = []
     hit_marks = []  # small markers for player-hit impact points
+    kill_feed = []  # list of {'text': str, 'life': int}
     death_text_timer = 0
 
     # round/score
@@ -177,6 +178,8 @@ def main():
     blue_team = []
     player = None
     covers = []
+    # bomb state: carried_by -> Soldier or None; planted boolean and site_rect
+    bomb = {'carried_by': None, 'planted': False, 'planted_by': None, 'x': None, 'y': None, 'site_rect': None}
 
     while running:
         # compute frame_scale based on actual ms per frame vs baseline 60fps
@@ -197,8 +200,21 @@ def main():
                     screen_w, screen_h = windowed_size
                     set_screen_size(screen_w, screen_h)
             elif event.type == pygame.KEYDOWN:
-                # F / F11 fullscreen toggle disabled because we start fullscreen by default
-                pass
+                # F: toggle fullscreen/windowed
+                if event.key == pygame.K_f:
+                    try:
+                        if fullscreen:
+                            pygame.display.set_mode(windowed_size, pygame.RESIZABLE)
+                            screen_w, screen_h = windowed_size
+                            fullscreen = False
+                        else:
+                            info = pygame.display.Info()
+                            screen = pygame.display.set_mode((info.current_w, info.current_h), pygame.FULLSCREEN)
+                            screen_w, screen_h = info.current_w, info.current_h
+                            fullscreen = True
+                        set_screen_size(screen_w, screen_h)
+                    except Exception:
+                        pass
                 # ESC returns to main menu from any mode
                 if event.key == pygame.K_ESCAPE:
                     # reset state and go back to menu
@@ -221,12 +237,22 @@ def main():
                     elif event.key == pygame.K_RETURN or event.key == pygame.K_KP_ENTER:
                         choice = menu_options[menu_idx]
                         # initialize game depending on choice
-                        covers = [Cover(random.randint(100,screen_w-200), random.randint(50,screen_h-150), 50, random.randint(60,160)) for _ in range(3)]
+                        # generate roguelike-style covers for more walls
+                        covers = make_roguelike_covers(screen_w, screen_h, cell=96, fill_prob=0.18)
                         bullets.clear(); grenades.clear(); particles.clear(); crates.clear()
                         if choice == 'Play':
-                            # spawn full 5v5, then replace one red soldier with the player-controlled soldier
-                            red_team = make_team(50, int(screen_w*0.25), (255,0,0), 5)
-                            blue_team = make_team(int(screen_w*0.75), screen_w-50, (0,0,255), 5)
+                            # pick randomly which color becomes T (they'll carry/plant the bomb)
+                            # red_color and blue_color refer to sprite color; T/CT assignment is per-team
+                            # we'll make either red or blue the Terrorist (T) side for this match
+                            t_color = random.choice([(255,0,0), (0,0,255)])
+                            ct_color = (0,0,255) if t_color == (255,0,0) else (255,0,0)
+                            # when creating teams, pass the side so all members share it
+                            if t_color == (255,0,0):
+                                red_team = make_team(50, int(screen_w*0.25), (255,0,0), 5, side='T', sprite_red=sprite_red, sprite_green=sprite_green, weapon_ak=weapon_ak, weapon_m4=weapon_m4, sounds=sounds, screen_h=screen_h)
+                                blue_team = make_team(int(screen_w*0.75), screen_w-50, (0,0,255), 5, side='CT', sprite_red=sprite_red, sprite_green=sprite_green, weapon_ak=weapon_ak, weapon_m4=weapon_m4, sounds=sounds, screen_h=screen_h)
+                            else:
+                                red_team = make_team(50, int(screen_w*0.25), (255,0,0), 5, side='CT', sprite_red=sprite_red, sprite_green=sprite_green, weapon_ak=weapon_ak, weapon_m4=weapon_m4, sounds=sounds, screen_h=screen_h)
+                                blue_team = make_team(int(screen_w*0.75), screen_w-50, (0,0,255), 5, side='T', sprite_red=sprite_red, sprite_green=sprite_green, weapon_ak=weapon_ak, weapon_m4=weapon_m4, sounds=sounds, screen_h=screen_h)
                             # create a player soldier
                             player = Soldier(100, screen_h//2, (255,0,0), role='rifle')
                             player.controlled = True
@@ -236,24 +262,61 @@ def main():
                             player.reload_time_frames = 180
                             player.reload_time = 6
                             player.sprite = sprite_red; player.weapon_img = weapon_m4; player.weapon_sound = sounds.get('m4a1')
+                            player.weapon_key = 'm4a1'
+                            try:
+                                print(f"SPAWN_PLAYER: name={player.name} weapon_key={getattr(player,'weapon_key',None)} sound_loaded={'yes' if sounds.get(getattr(player,'weapon_key',None)) else 'no'}")
+                            except Exception:
+                                pass
                             # replace one AI with player so player is part of the 5-member red team
                             if red_team:
                                 red_team[0] = player
-                        else:
+                            # create a bomb site on the CT spawn and give the bomb to a random T soldier
+                            try:
+                                # determine which color is CT to place the site in their spawn area
+                                if (red_team and getattr(red_team[0], 'side', None) == 'CT'):
+                                    bomb_site = pygame.Rect(20, screen_h//2 - 48, 96, 96)
+                                else:
+                                    bomb_site = pygame.Rect(screen_w-20-96, screen_h//2 - 48, 96, 96)
+                                bomb['site_rect'] = bomb_site
+                                bomb['planted'] = False; bomb['planted_by'] = None; bomb['carried_by'] = None
+                                # give the bomb to a random T team soldier
+                                t_candidates = [s for s in (red_team + blue_team) if getattr(s, 'side', None) == 'T']
+                                if t_candidates:
+                                    carrier = random.choice(t_candidates)
+                                    carrier.carrying_bomb = True
+                                    bomb['carried_by'] = carrier
+                            except Exception:
+                                pass
+                        elif choice == 'Simulation':
                             # simulation: full AI 5v5, no player control
-                            red_team = make_team(50, int(screen_w*0.25), (255,0,0), 5)
-                            blue_team = make_team(int(screen_w*0.75), screen_w-50, (0,0,255), 5)
+                            # pick randomly which color is T
+                            t_color = random.choice([(255,0,0), (0,0,255)])
+                            if t_color == (255,0,0):
+                                red_team = make_team(50, int(screen_w*0.25), (255,0,0), 5, side='T', sprite_red=sprite_red, sprite_green=sprite_green, weapon_ak=weapon_ak, weapon_m4=weapon_m4, sounds=sounds, screen_h=screen_h)
+                                blue_team = make_team(int(screen_w*0.75), screen_w-50, (0,0,255), 5, side='CT', sprite_red=sprite_red, sprite_green=sprite_green, weapon_ak=weapon_ak, weapon_m4=weapon_m4, sounds=sounds, screen_h=screen_h)
+                            else:
+                                red_team = make_team(50, int(screen_w*0.25), (255,0,0), 5, side='CT', sprite_red=sprite_red, sprite_green=sprite_green, weapon_ak=weapon_ak, weapon_m4=weapon_m4, sounds=sounds, screen_h=screen_h)
+                                blue_team = make_team(int(screen_w*0.75), screen_w-50, (0,0,255), 5, side='T', sprite_red=sprite_red, sprite_green=sprite_green, weapon_ak=weapon_ak, weapon_m4=weapon_m4, sounds=sounds, screen_h=screen_h)
                             # ensure no player object remains and no soldier is marked controlled
                             player = None
                             for s in red_team+blue_team:
                                 s.controlled = False
                                 s.mag_capacity = 30; s.mag = 30; s.reserve = 90; s.reload_time_frames = 90
+                        elif choice == 'Sandbox':
+                            # sandbox: empty scene for debugging; no teams, start empty and let user spawn via debug keys
+                            red_team = []
+                            blue_team = []
+                            player = None
+                            bullets.clear(); grenades.clear(); particles.clear(); crates.clear(); explosion_anims.clear(); image_particles.clear()
+                            # ensure no bomb in sandbox
+                            bomb['carried_by'] = None; bomb['planted'] = False; bomb['planted_by'] = None; bomb['site_rect'] = None
+                        # reset round state and scores
                         round_state = 1; rounds = {'red':0,'blue':0}
                         mode = choice.lower()
                 # debug keys available while in a mode (not in menu)
                 if event.key == pygame.K_e and mode != 'menu':
                     mx, my = pygame.mouse.get_pos()
-                    spawn_explosion(mx, my, magnitude=1.0)
+                    spawn_explosion(mx, my, explosion_frames, generic_images, explosion_anims, image_particles, magnitude=1.0)
                 if event.key == pygame.K_g and mode != 'menu':
                     # spawn only generic image particles at mouse
                     mx, my = pygame.mouse.get_pos()
@@ -272,6 +335,90 @@ def main():
                                 'scale': random.uniform(0.3, 1.4)
                             }
                             image_particles.append(ip)
+                # spawn a test pawn in Sandbox with K
+                if event.key == pygame.K_k and mode == 'sandbox':
+                    mx, my = pygame.mouse.get_pos()
+                    # spawn a test rifleman for the active side (blue)
+                    spawn_pawn(mx, my, (0,0,255), 'rifle', blue_team, sprite_green, weapon_m4, 'm4a1')
+                # spawn a red test pawn in sandbox (Y)
+                if event.key == pygame.K_y and mode == 'sandbox':
+                    mx, my = pygame.mouse.get_pos()
+                    spawn_pawn(mx, my, (255,0,0), 'rifle', red_team, sprite_red, weapon_m4, 'm4a1')
+                # spawn a red bomb-carrying pawn in sandbox (U)
+                if event.key == pygame.K_u and mode == 'sandbox':
+                    mx, my = pygame.mouse.get_pos()
+                    s = spawn_pawn(mx, my, (255,0,0), 'rifle', red_team, sprite_red, weapon_m4, 'm4a1')
+                    s.carrying_bomb = True
+                    bomb['carried_by'] = s
+                # plant bomb (P) if carrying and inside site
+                if event.key == pygame.K_p and mode != 'menu':
+                    try:
+                        if bomb.get('carried_by') is not None and bomb.get('site_rect') is not None:
+                            cb = bomb['carried_by']
+                            if bomb['site_rect'].collidepoint(int(cb.x), int(cb.y)):
+                                bomb['planted'] = True
+                                bomb['planted_by'] = cb
+                                bomb['carried_by'] = None
+                                # award round to planting team and advance round
+                                team_name = 'blue' if getattr(cb, 'color', None) == (0,0,255) else 'red'
+                                rounds[team_name] = rounds.get(team_name, 0) + 1
+                                round_state = 2; round_timer = 180
+                                print(f"BOMB: planted by {getattr(cb,'name',None)} team={team_name}")
+                    except Exception:
+                        pass
+                # debug: give bomb to a soldier or spawn a bomb-carrying soldier in sandbox (B)
+                if event.key == pygame.K_b and mode != 'menu':
+                    try:
+                        mx,my = pygame.mouse.get_pos()
+                        if mode == 'sandbox':
+                            spawn_bomb_carrier_sandbox(mx, my, blue_team, sprite_green, weapon_m4, 'm4a1', bomb)
+                        else:
+                            # in play/simulation, give the bomb to a random blue soldier if exists
+                            give_bomb_to_random_team(blue_team, bomb)
+                    except Exception:
+                        pass
+                # drop bomb at mouse (O) — if carried, drop it here; otherwise place a dropped bomb
+                if event.key == pygame.K_o and mode != 'menu':
+                    try:
+                        mx, my = pygame.mouse.get_pos()
+                        # if a carrier exists, force-drop at mouse
+                        cb = bomb.get('carried_by')
+                        if cb is not None:
+                            try:
+                                cb.carrying_bomb = False
+                            except Exception:
+                                pass
+                            bomb['carried_by'] = None
+                        bomb['x'] = int(mx); bomb['y'] = int(my); bomb['planted'] = False
+                        print(f"DEBUG: bomb dropped at {bomb['x']},{bomb['y']}")
+                    except Exception:
+                        pass
+                # give bomb to a random T-side pawn (G)
+                if event.key == pygame.K_g and mode != 'menu':
+                    try:
+                        t_candidates = [s for s in (red_team + blue_team) if getattr(s, 'side', None) == 'T']
+                        if t_candidates:
+                            give_bomb_to_random_team(t_candidates, bomb)
+                    except Exception:
+                        pass
+                # clear bullets/grenades/particles (C)
+                if event.key == pygame.K_c and mode != 'menu':
+                    try:
+                        clear_entities(bullets, grenades, particles)
+                        print('DEBUG: cleared bullets, grenades, and particles')
+                    except Exception:
+                        pass
+                    except Exception:
+                        pass
+                # allow forcing weapon sounds in sandbox/debug modes
+                if event.key == pygame.K_h and mode != 'menu':
+                    if sounds.get('m4a1'):
+                        try: play_sound_obj(sounds['m4a1'], sounds)
+                        except Exception: pass
+                if event.key == pygame.K_j and mode != 'menu':
+                    if sounds.get('ak47'):
+                        try: play_sound_obj(sounds['ak47'], sounds)
+                        except Exception: pass
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if mode == 'menu' and event.button == 1:
                     # click confirms current selection
@@ -306,7 +453,29 @@ def main():
             if keys[pygame.K_s] or keys[pygame.K_DOWN]: mvy += player.speed*1.8
             if keys[pygame.K_a] or keys[pygame.K_LEFT]: mvx -= player.speed*1.8
             if keys[pygame.K_d] or keys[pygame.K_RIGHT]: mvx += player.speed*1.8
-            player.x += mvx; player.y += mvy
+            # attempt movement but avoid entering covers (slide along if blocked)
+            cand_x = player.x + mvx
+            cand_y = player.y + mvy
+            blocked = False
+            for cov in covers:
+                try:
+                    if cov.rect.collidepoint(cand_x, cand_y):
+                        blocked = True
+                        break
+                except Exception:
+                    pass
+            if not blocked:
+                player.x = cand_x; player.y = cand_y
+            else:
+                # try sliding on X only
+                cand_x2 = player.x + mvx
+                blocked_x = any((cov.rect.collidepoint(cand_x2, player.y) for cov in covers))
+                cand_y2 = player.y + mvy
+                blocked_y = any((cov.rect.collidepoint(player.x, cand_y2) for cov in covers))
+                if not blocked_x:
+                    player.x = cand_x2
+                elif not blocked_y:
+                    player.y = cand_y2
             player.stay_in_bounds()
             # face based on mouse position so the texture mirrors correctly
             try:
@@ -321,19 +490,39 @@ def main():
                 player.reloading = True
                 player.reload_timer = player.reload_time_frames
             # shooting with left mouse
-            player.reload_counter += 1
+            # use frame-scaled timing (matches AI which uses FRAME_SCALE)
+            player.reload_counter += frame_scale
             if mbuttons[0] and not player.reloading and player.reload_counter >= player.reload_time and player.mag>0:
-                bullets.append(Bullet(player.x + player.weapon_length, player.y, mx, my, player.color, damage=player.damage, owner=player))
+                # prevent player shooting through solid covers
+                if not _line_blocked_by_covers(player.x, player.y, mx, my, covers):
+                    bullets.append(Bullet(player.x + player.weapon_length, player.y, mx, my, player.color, damage=player.damage, owner=player))
                 try:
-                    if getattr(player, 'weapon_sound', None): player.weapon_sound.play()
+                    # prefer weapon_key mapping to avoid accidental explosion sound usage
+                    wk = getattr(player, 'weapon_key', None)
+                    s = None
+                    if wk and sounds.get(wk):
+                        s = sounds.get(wk)
+                    else:
+                        s = (sounds.get('shoot_red') if player.color == (255,0,0) else sounds.get('shoot_blue'))
+                    if s and s is not sounds.get('explosion') and s is not sounds.get('grenade'):
+                        play_sound_obj(s, sounds)
                 except Exception:
                     pass
                 player.mag -= 1
                 player.reload_counter = 0
+            # debug: force play weapon sounds
+            if keys[pygame.K_h]:
+                if sounds.get('m4a1'):
+                    try: play_sound_obj(sounds['m4a1'], sounds)
+                    except Exception: pass
+            if keys[pygame.K_j]:
+                if sounds.get('ak47'):
+                    try: play_sound_obj(sounds['ak47'], sounds)
+                    except Exception: pass
                 player.recoil_timer = 3
-            # handle player reload timer if reloading
+            # handle player reload timer if reloading (frame-scaled)
             if player.reloading:
-                player.reload_timer -= 1
+                player.reload_timer -= frame_scale
                 if player.reload_timer <= 0:
                     needed = max(0, player.mag_capacity - player.mag)
                     to_load = min(needed, player.reserve)
@@ -345,9 +534,9 @@ def main():
         for s in list(red_team):
             if getattr(s, 'controlled', False):
                 continue
-            s.update(blue_team, bullets, grenades, covers, crates, red_team, sounds)
+            s.update(blue_team, bullets, grenades, covers, crates, red_team, sounds, bomb)
         for s in list(blue_team):
-            s.update(red_team, bullets, grenades, covers, crates, blue_team, sounds)
+            s.update(red_team, bullets, grenades, covers, crates, blue_team, sounds, bomb)
 
         # parallel updates for cheap objects - safe because these do not access pygame surfaces
         try:
@@ -406,6 +595,21 @@ def main():
                 try: bullets.remove(b)
                 except: pass
                 continue
+            # cover collision: bullets are blocked by covers (act like walls)
+            blocked = False
+            for cov in covers:
+                try:
+                    if cov.rect.collidepoint(b.x, b.y):
+                        # spawn small impact particles and remove bullet
+                        for _ in range(4): particles.append(Particle(b.x, b.y, random.uniform(-1.5,1.5), random.uniform(-1.5,1.5), random.randint(6,12), (180,180,180)))
+                        try: bullets.remove(b)
+                        except: pass
+                        blocked = True
+                        break
+                except Exception:
+                    pass
+            if blocked:
+                continue
             hit = False
             for team in [red_team, blue_team]:
                 for s in team:
@@ -414,12 +618,30 @@ def main():
                             if s.shield>0:
                                 s.shield -=1
                             else:
+                                # record last attacker for kill feed
+                                try:
+                                    s.last_attacker = getattr(b.owner, 'name', None)
+                                except Exception:
+                                    s.last_attacker = None
                                 s.hp -= b.damage
                                 s.face_expression = 'hit'; s.speech_text = 'Ouch!'; s.speech_timer = 30
+                                # if soldier was carrying the bomb, drop it here
+                                try:
+                                    if getattr(s, 'carrying_bomb', False):
+                                        s.carrying_bomb = False
+                                        if bomb.get('carried_by') is s:
+                                            bomb['carried_by'] = None
+                                            # place dropped bomb near soldier
+                                            bomb['x'] = int(s.x + random.randint(-8,8))
+                                            bomb['y'] = int(s.y + random.randint(-8,8))
+                                            bomb['planted'] = False
+                                except Exception:
+                                    pass
                                 # play damage sound if available
                                 try:
                                     if sounds.get('damage'):
-                                        sounds['damage'].play()
+                                        try: play_sound_obj(sounds['damage'], sounds)
+                                        except Exception: pass
                                 except Exception:
                                     pass
                                 # spawn a hit mark if this bullet was fired by the player in play mode
@@ -440,11 +662,11 @@ def main():
                 # explosion logic: handle damage and small particles (in grenades.explode)
                 g.explode(red_team+blue_team, particles)
                 if sounds.get('explosion'):
-                    try: sounds['explosion'].play()
+                    try: play_sound_obj(sounds['explosion'], sounds)
                     except Exception: pass
                 camera_shake = 12
                 # spawn visuals using the shared helper (faster animation + random generic images)
-                spawn_explosion(g.x, g.y, magnitude=1.0)
+                spawn_explosion(g.x, g.y, explosion_frames, generic_images, explosion_anims, image_particles, magnitude=1.0)
                 # remove grenade
                 try: grenades.remove(g)
                 except Exception: pass
@@ -505,6 +727,15 @@ def main():
         # cleanup dead
         prev_red = red_team
         prev_blue = blue_team
+        # produce kill-feed entries for soldiers who just died
+        newly_dead = [s for s in (prev_red + prev_blue) if getattr(s, 'hp', 0) <= 0]
+        for d in newly_dead:
+            try:
+                killer = getattr(d, 'last_attacker', None) or 'Unknown'
+                feed_text = f"{killer} killed {getattr(d, 'name', 'Soldier')}"
+                kill_feed.append({'text': feed_text, 'life': 180})
+            except Exception:
+                pass
         red_team = [s for s in red_team if s.hp>0]
         blue_team = [s for s in blue_team if s.hp>0]
         # If the controlled player died this frame, clear the player reference so it can no longer act
@@ -530,11 +761,33 @@ def main():
                 if rounds['red'] >= (best_of+1)//2 or rounds['blue'] >= (best_of+1)//2:
                     round_state = 3
                 else:
-                    # respawn teams
-                    red_team = make_team(50,200,(255,0,0),5)
-                    blue_team = make_team(600,750,(0,0,255),5)
-                    bullets.clear(); grenades.clear(); particles.clear(); crates.clear()
-                    round_state = 1
+                    # respawn teams unless sandbox
+                    if mode != 'sandbox':
+                        # pick which color is Terrorist this round
+                        t_color = random.choice([(255,0,0), (0,0,255)])
+                        if t_color == (255,0,0):
+                            red_team = make_team(50,200,(255,0,0),5, side='T', sprite_red=sprite_red, sprite_green=sprite_green, weapon_ak=weapon_ak, weapon_m4=weapon_m4, sounds=sounds, screen_h=screen_h)
+                            blue_team = make_team(600,750,(0,0,255),5, side='CT', sprite_red=sprite_red, sprite_green=sprite_green, weapon_ak=weapon_ak, weapon_m4=weapon_m4, sounds=sounds, screen_h=screen_h)
+                        else:
+                            red_team = make_team(50,200,(255,0,0),5, side='CT', sprite_red=sprite_red, sprite_green=sprite_green, weapon_ak=weapon_ak, weapon_m4=weapon_m4, sounds=sounds, screen_h=screen_h)
+                            blue_team = make_team(600,750,(0,0,255),5, side='T', sprite_red=sprite_red, sprite_green=sprite_green, weapon_ak=weapon_ak, weapon_m4=weapon_m4, sounds=sounds, screen_h=screen_h)
+                        bullets.clear(); grenades.clear(); particles.clear(); crates.clear()
+                        # reset bomb for normal rounds; place site on CT spawn and give bomb to a T soldier
+                        try:
+                            if (red_team and getattr(red_team[0], 'side', None) == 'CT'):
+                                bomb_site = pygame.Rect(20, screen_h//2 - 48, 96, 96)
+                            else:
+                                bomb_site = pygame.Rect(screen_w-20-96, screen_h//2 - 48, 96, 96)
+                            bomb['site_rect'] = bomb_site
+                            bomb['planted'] = False; bomb['planted_by'] = None; bomb['carried_by'] = None
+                            t_candidates = [s for s in (red_team + blue_team) if getattr(s, 'side', None) == 'T']
+                            if t_candidates:
+                                carrier = random.choice(t_candidates)
+                                carrier.carrying_bomb = True
+                                bomb['carried_by'] = carrier
+                        except Exception:
+                            bomb['carried_by'] = None; bomb['planted'] = False; bomb['planted_by'] = None; bomb['site_rect'] = None
+                        round_state = 1
 
         # camera shake decay
         if camera_shake>0:
@@ -554,9 +807,20 @@ def main():
                 max_radius = max(getattr(s, 'radius', default_inset) for s in all_soldiers)
             else:
                 max_radius = default_inset
+            # inset equals pawn radius so clamp matches exactly
             border_inset = int(max_radius)
-            rect = pygame.Rect(border_inset, border_inset, max(0, screen_w - border_inset*2), max(0, screen_h - border_inset*2))
-            pygame.draw.rect(screen, (255, 120, 50), rect, 4)
+            # draw a 1px inner rect showing playable/clamped area exactly
+            inner_left = border_inset
+            inner_top = border_inset
+            inner_w = max(0, screen_w - border_inset*2)
+            inner_h = max(0, screen_h - border_inset*2)
+            try:
+                color = (255, 120, 50)
+                rect = pygame.Rect(inner_left, inner_top, inner_w, inner_h)
+                # draw an inner rect border (1 px). Using rect fixes asymmetric off-by-one issues.
+                pygame.draw.rect(screen, color, rect, 1)
+            except Exception:
+                pass
         except Exception:
             pass
         for c in covers: c.draw(screen)
@@ -594,49 +858,19 @@ def main():
                 pass
 
         for cr in crates: cr.draw(screen)
-
-        # HUD (use cached font)
-        txt = _default_font.render(f"Round state: {round_state}  Rounds R:{rounds['red']} B:{rounds['blue']}", True, (255,255,255))
-        screen.blit(txt, (8,8))
-        # lightweight debug overlay to validate explosion assets and active effects
+        # draw bomb indicators & carrier visuals (delegated to bomb module)
         try:
-            dbg = f"ExplFrames: {len(explosion_frames)}  GenImgs: {len(generic_images)}  ActiveExpl: {len(explosion_anims)}  ImgParts: {len(image_particles)}"
-            dbg_s = _small_font.render(dbg, True, (200,200,200))
-            screen.blit(dbg_s, (8, 32))
+            draw_bomb(screen, bomb, bomb_img)
         except Exception:
             pass
 
-        # draw player ammo in play mode
-        if mode == 'play' and player:
-            try:
-                ammo_s = _ammo_font.render(f"Ammo: {player.mag}/{player.reserve}", True, (255,255,0))
-                screen.blit(ammo_s, (screen_w-10-ammo_s.get_width(), 10))
-                # show reload indicator
-                if player.reloading:
-                    r_s = _ammo_font.render('RELOADING...', True, (255,120,0))
-                    screen.blit(r_s, (screen_w-10-r_s.get_width(), 34))
-            except Exception:
-                pass
-        # if player died recently, show death text
-        if mode == 'play' and death_text_timer > 0:
-            try:
-                death_text_timer -= 1
-                dt_surf = _title_font.render('YOU DIED', True, (220,40,40))
-                screen.blit(dt_surf, (screen_w//2 - dt_surf.get_width()//2, screen_h//2 - dt_surf.get_height()//2))
-            except Exception:
-                pass
-
-        # draw hit marks
-        for hm in hit_marks:
-            x = int(hm['x']); y = int(hm['y'])
-            life = hm.get('life', 0)
-            alpha = int(255 * (life / 30)) if life>0 else 0
-            # simple red X
-            try:
-                pygame.draw.line(screen, (255,80,80), (x-6,y-6), (x+6,y+6), 2)
-                pygame.draw.line(screen, (255,80,80), (x+6,y-6), (x-6,y+6), 2)
-            except Exception:
-                pass
+        # draw HUD and overlays via ui module (centralizes HUD code)
+        try:
+            fonts = {'_default_font': _default_font, '_small_font': _small_font, '_ammo_font': _ammo_font, '_title_font': _title_font}
+            state = {'screen_w': screen_w, 'screen_h': screen_h, 'mode': mode, 'round_state': round_state, 'rounds': rounds, 'kill_feed': kill_feed, 'explosion_frames': explosion_frames, 'generic_images': generic_images, 'explosion_anims': explosion_anims, 'image_particles': image_particles, 'player': player, 'death_text_timer': death_text_timer, 'hit_marks': hit_marks}
+            draw_hud(screen, fonts, state)
+        except Exception:
+            pass
 
         pygame.display.flip()
 

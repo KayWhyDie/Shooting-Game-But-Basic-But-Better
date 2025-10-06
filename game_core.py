@@ -2,6 +2,20 @@ import pygame
 import random
 import math
 
+# small helper so modules inside game_core can play sounds using available mixer channels
+def play_sound_local(snd):
+    try:
+        if not snd:
+            return
+        ch = pygame.mixer.find_channel(True)
+        if ch:
+            ch.play(snd)
+    except Exception:
+        try:
+            snd.play()
+        except Exception:
+            pass
+
 # Screen size used by entities; main updates this via set_screen_size
 SCREEN_W = 800
 SCREEN_H = 600
@@ -29,6 +43,46 @@ DEFAULT_RELOAD_TIME = 45
 
 def clamp(v, a, b):
     return max(a, min(b, v))
+
+
+def _line_blocked_by_covers(x1, y1, x2, y2, covers):
+    # return True if any cover rect intersects the segment (x1,y1)-(x2,y2)
+    # Use a conservative sampling approach (step along the line) to avoid
+    # corner-case misses from integer clipping and thin intersections.
+    try:
+        if not covers:
+            return False
+        dx = x2 - x1; dy = y2 - y1
+        dist = math.hypot(dx, dy) or 1.0
+        # sample roughly every 4 pixels along the segment
+        step = max(1, int(dist // 4))
+        steps = max(1, int(dist / step))
+        for i in range(steps + 1):
+            t = i / float(steps)
+            sx = x1 + dx * t
+            sy = y1 + dy * t
+            for c in covers:
+                if c.rect.collidepoint(sx, sy):
+                    return True
+        # final fallback: also try clipline as a quick check
+        for c in covers:
+            if c.rect.clipline((int(x1), int(y1), int(x2), int(y2))):
+                return True
+    except Exception:
+        pass
+    return False
+
+# Small pool of bot names
+BOT_NAMES = [
+    'Viper','Rook','Ghost','Echo','Nova','Blitz','Hawk','Mako','Raven','Zephyr',
+    'Drift','Sable','Onyx','Jinx','Kite','Frost','Atlas','Crimson','Byte','Volt'
+]
+
+def random_bot_name():
+    try:
+        return random.choice(BOT_NAMES)
+    except Exception:
+        return 'Bot'
 
 
 class Cover:
@@ -76,7 +130,7 @@ class Particle:
 
 
 class Grenade:
-    def __init__(self, x, y, tx, ty):
+    def __init__(self, x, y, tx, ty, owner=None):
         self.x = float(x)
         self.y = float(y)
         dx = float(tx) - self.x
@@ -87,6 +141,7 @@ class Grenade:
         self.timer = 90.0
         self.radius = 6
         self.bounce = 0.6
+        self.owner = owner
 
     def update(self):
         self.x += self.vx * FRAME_SCALE
@@ -105,6 +160,12 @@ class Grenade:
         # grey shrapnel particle effect removed (visuals are handled centrally in main.spawn_explosion)
         for s in soldiers:
             if math.hypot(self.x - s.x, self.y - s.y) < 80:
+                # attribute owner (if present) for kill feed
+                try:
+                    if getattr(self, 'owner', None) is not None:
+                        s.last_attacker = getattr(self.owner, 'name', None)
+                except Exception:
+                    pass
                 s.hp -= 30
                 s.face_expression = 'hit'
                 s.speech_text = 'Argh!'
@@ -137,21 +198,26 @@ class Bullet:
 
 
 class Soldier:
-    def __init__(self, x, y, color, role='rifle'):
+    def __init__(self, x, y, color, role='rifle', name=None):
         self.x = float(x)
         self.y = float(y)
         self.color = color
         self.role = role
-        self.radius = 10
+        # assign a readable name for kill notifications and debug
+        self.name = name if name else random_bot_name()
+        # slightly larger pawns for better visibility
+        self.radius = 17
         self.max_hp = 100
         self.hp = self.max_hp
         self.speed = 1.5
         # firing cooldown (frames) and counter
-        self.reload_counter = 0.0
+        # start with a randomized counter so not all pawns fire at the same time
+        self.reload_counter = random.uniform(0.0, DEFAULT_RELOAD_TIME)
         # temporary retreat when too close to an enemy
         self.temporary_retreat_frames = 0
         self.temporary_retreat_target = None
-        self.weapon_length = 15
+        # slightly longer weapon length so guns are more visible
+        self.weapon_length = 26
         self.face_expression = 'default'
         self.speech_timer = 0.0
         self.speech_text = ''
@@ -174,9 +240,19 @@ class Soldier:
         self.melee_timer = 0.0
         self.melee_damage = 20
         self.facing_right = True
+        # debug cooldown to avoid spamming console when diagnosing firing issues
+        self._debug_fire_cooldown = 0.0
+        # bomb carrying flag (used by bomb game mode)
+        self.carrying_bomb = False
+        # simple stuck detection: remember recent positions
+        self._last_pos_check_x = self.x
+        self._last_pos_check_y = self.y
+        self._stuck_frames = 0
 
         # role based tuning (unified reload/fire rate)
         self.reload_time = DEFAULT_RELOAD_TIME
+        # keep a base reload time to apply a small random jitter per-shot
+        self.reload_time_base = float(self.reload_time)
         if role == 'sniper':
             self.damage = 40
             self.range = 900
@@ -197,22 +273,76 @@ class Soldier:
             self.damage = 12
             self.range = 400
 
+        # finalize reload_time_base based on potentially modified reload_time
+        try:
+            self.reload_time_base = float(self.reload_time)
+        except Exception:
+            self.reload_time_base = float(DEFAULT_RELOAD_TIME)
+        # initialize reload counter based on the finalized base so AI are staggered
+        try:
+            self.reload_counter = random.uniform(0.0, max(1.0, self.reload_time_base))
+        except Exception:
+            self.reload_counter = random.uniform(0.0, DEFAULT_RELOAD_TIME)
+
     def in_cover(self, covers):
         for c in covers:
             if c.rect.collidepoint(self.x, self.y):
                 return True
         return False
 
-    def move_towards(self, target):
+    def move_towards(self, target, covers):
+        # move toward target but avoid entering cover rectangles
         dx = target.x - self.x
         dy = target.y - self.y
         dist = math.hypot(dx, dy) or 1.0
         if dist > 1.0:
-            self.x += dx / dist * (self.speed * FRAME_SCALE)
-            self.y += dy / dist * (self.speed * FRAME_SCALE)
+            step_x = self.x + dx / dist * (self.speed * FRAME_SCALE)
+            step_y = self.y + dy / dist * (self.speed * FRAME_SCALE)
+            # prefer full step if not blocked
+            if not self.blocked_by_covers(step_x, step_y, covers):
+                self.x = step_x; self.y = step_y
+            else:
+                # try smaller steps and axis-aligned moves to slide along obstacles
+                tried = False
+                for factor in (0.6, 0.4, 0.2):
+                    sx = self.x + dx / dist * (self.speed * FRAME_SCALE * factor)
+                    sy = self.y + dy / dist * (self.speed * FRAME_SCALE * factor)
+                    if not self.blocked_by_covers(sx, sy, covers):
+                        self.x = sx; self.y = sy; tried = True; break
+                if not tried:
+                    # axis slide attempts
+                    sx = self.x + dx / dist * (self.speed * FRAME_SCALE)
+                    if not self.blocked_by_covers(sx, self.y, covers):
+                        self.x = sx
+                    else:
+                        sy = self.y + dy / dist * (self.speed * FRAME_SCALE)
+                        if not self.blocked_by_covers(self.x, sy, covers):
+                            self.y = sy
         self.stay_in_bounds()
 
-    def dodge_bullets(self, bullets):
+    def blocked_by_covers(self, x, y, covers):
+        # returns True if the point (x,y) would be inside any cover rect
+        try:
+            for c in covers:
+                if c.rect.collidepoint(x, y):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def try_move_to(self, x, y, covers):
+        # safe move with cover checks; returns True if moved
+        if not self.blocked_by_covers(x, y, covers):
+            self.x = x; self.y = y; return True
+        # try sliding on x
+        if not self.blocked_by_covers(x, self.y, covers):
+            self.x = x; return True
+        # try sliding on y
+        if not self.blocked_by_covers(self.x, y, covers):
+            self.y = y; return True
+        return False
+
+    def dodge_bullets(self, bullets, covers):
         # reduce dodge power and impose a cooldown
         if self.dodge_timer > 0:
             # count down cooldown
@@ -226,8 +356,11 @@ class Soldier:
             # reduced detection radius
             if dist < 40:
                 # smaller dodge distance
-                self.x -= dx / dist * (self.speed * 1.0 * FRAME_SCALE)
-                self.y -= dy / dist * (self.speed * 1.0 * FRAME_SCALE)
+                cand_x = self.x - dx / dist * (self.speed * 1.0 * FRAME_SCALE)
+                cand_y = self.y - dy / dist * (self.speed * 1.0 * FRAME_SCALE)
+                # only dodge into free space
+                if not self.blocked_by_covers(cand_x, cand_y, covers):
+                    self.x = cand_x; self.y = cand_y
                 # set cooldown so the soldier won't dodge again immediately
                 self.dodge_timer = self.dodge_cooldown_frames
                 break
@@ -237,139 +370,92 @@ class Soldier:
         self.x = clamp(self.x, self.radius, SCREEN_W - self.radius)
         self.y = clamp(self.y, self.radius, SCREEN_H - self.radius)
 
-    def update(self, enemies, bullets, grenades, covers, crates, allies, sounds):
-        # simple retreat logic when alone
+    def update(self, enemies, bullets, grenades, covers, crates, allies, sounds, bomb=None):
+        # Basic per-frame updates for soldiers with cover-aware movement
+        # Retreat if alone occasionally
         if allies is not None and len(allies) <= 1 and random.random() < 0.02:
             self.retreating = True
+
         if self.retreating:
-            # move toward a safe X position but do not return; allow firing and other logic
             target_x = 50 if self.color == (255, 0, 0) else SCREEN_W - 50
             dx = target_x - self.x
             if abs(dx) > 5:
-                self.x += math.copysign(self.speed * 1.5 * FRAME_SCALE, dx)
+                self.try_move_to(self.x + math.copysign(self.speed * 1.5 * FRAME_SCALE, dx), self.y, covers)
             self.stay_in_bounds()
-            # if pinned at border (can't move further) and enemies are nearby, cancel retreat so soldier fights
-            pinned = (self.x <= self.radius + 1) or (self.x >= SCREEN_W - self.radius - 1)
-            if pinned and enemies:
-                # if an enemy is within threat distance, stop retreating so soldier can engage
+            # cancel retreat if enemy nearby
+            if enemies:
                 nearest_enemy = min(enemies, key=lambda e: math.hypot(e.x - self.x, e.y - self.y))
                 if math.hypot(nearest_enemy.x - self.x, nearest_enemy.y - self.y) < 220:
                     self.retreating = False
 
-        # still allow dodging while moving
-        self.dodge_bullets(bullets)
+        # dodge bullets (cover-aware)
+        self.dodge_bullets(bullets, covers)
 
-        # find nearest enemy target
+        # find nearest enemy
         target = None
         if enemies:
             target = min(enemies, key=lambda e: math.hypot(e.x - self.x, e.y - self.y))
-        if target is not None:
             try:
                 self.facing_right = (target.x > self.x)
             except Exception:
                 pass
 
-        # seek crates if nearby
+        # seek crates
         if crates:
             try:
                 nearest_crate = min(crates, key=lambda c: math.hypot(c.x - self.x, c.y - self.y))
                 if math.hypot(nearest_crate.x - self.x, nearest_crate.y - self.y) < (140 * FRAME_SCALE):
-                    self.move_towards(nearest_crate)
+                    self.move_towards(nearest_crate, covers)
             except Exception:
                 pass
 
-        # Role-based desired engagement ranges (units)
-        desired_ranges = {
-            'sniper': 420,
-            'rifle': 220,
-            'grenadier': 260,
-            'medic': 140,
-            'heavy': 60,
-        }
+        # engagement ranges
+        desired_ranges = {'sniper':420,'rifle':220,'grenadier':260,'medic':140,'heavy':60}
 
-        # If we have a target and are not in cover, decide movement
+        # movement & engagement
         if target and not self.in_cover(covers):
             dist_to_target = math.hypot(target.x - self.x, target.y - self.y)
             desired = desired_ranges.get(self.role, 180)
 
-            # If soldier is completely out of ammo (no mag and no reserve), try to pick up an ammo/fast_reload crate first.
+            # pick up ammo if empty and none in mag/reserve
             if self.mag <= 0 and self.reserve <= 0:
-                ammo_crates = [c for c in crates if getattr(c, 'kind', '') in ('ammo', 'fast_reload')]
+                ammo_crates = [c for c in crates if getattr(c,'kind','') in ('ammo','fast_reload')]
                 if ammo_crates:
                     nearest = min(ammo_crates, key=lambda c: math.hypot(c.x - self.x, c.y - self.y))
-                    # step towards crate carefully to avoid border-clamping
-                    dx = nearest.x - self.x
-                    dy = nearest.y - self.y
+                    dx = nearest.x - self.x; dy = nearest.y - self.y
                     d = math.hypot(dx, dy) or 1.0
                     cand_x = self.x + (dx / d) * (self.speed * FRAME_SCALE)
                     cand_y = self.y + (dy / d) * (self.speed * FRAME_SCALE)
-                    if not (cand_x <= self.radius or cand_x >= SCREEN_W - self.radius or cand_y <= self.radius or cand_y >= SCREEN_H - self.radius):
-                        self.x = cand_x; self.y = cand_y
-                    else:
-                        # small lateral nudge to try free space
-                        self.x += (self.speed * 0.5 * FRAME_SCALE) * (1 if self.x < SCREEN_W/2 else -1)
+                    self.try_move_to(cand_x, cand_y, covers)
                 else:
-                    # no ammo available, close to enemies to melee
-                    self.move_towards(target)
+                    self.move_towards(target, covers)
             else:
-                # Normal ranged behavior: approach if too far
                 if dist_to_target > (desired + 20):
-                    self.move_towards(target)
-                elif dist_to_target < max(12, (desired * 0.5)):
-                    # too close: try to step away, but avoid border-clamping
-                    if self.role != 'heavy' and not getattr(self, 'controlled', False):
-                        # if a temporary retreat target is active, move toward it
-                        if self.temporary_retreat_frames > 0 and self.temporary_retreat_target:
-                            try:
-                                tx, ty = self.temporary_retreat_target
-                                dx = tx - self.x; dy = ty - self.y
-                                d = math.hypot(dx, dy) or 1.0
-                                self.x += (dx / d) * (self.speed * 1.5 * FRAME_SCALE)
-                                self.y += (dy / d) * (self.speed * 1.5 * FRAME_SCALE)
-                                self.temporary_retreat_frames -= 1
-                                if self.temporary_retreat_frames <= 0:
-                                    self.temporary_retreat_target = None
-                            except Exception:
-                                self.temporary_retreat_target = None
-                        else:
-                            dx = self.x - target.x
-                            dy = self.y - target.y
-                            dd = math.hypot(dx, dy) or 1.0
-                            step_x = self.x + (dx / dd) * (self.speed * 1.2 * FRAME_SCALE)
-                            step_y = self.y + (dy / dd) * (self.speed * 1.2 * FRAME_SCALE)
-                            if (step_x <= self.radius or step_x >= SCREEN_W - self.radius or step_y <= self.radius or step_y >= SCREEN_H - self.radius):
-                                # can't step directly away because of map border - try nearest cover
-                                if covers:
-                                    try:
-                                        nearest_cover = min(covers, key=lambda c: math.hypot(c.rect.centerx - self.x, c.rect.centery - self.y))
-                                        # move a small step toward cover
-                                        cdx = nearest_cover.rect.centerx - self.x
-                                        cdy = nearest_cover.rect.centery - self.y
-                                        cd = math.hypot(cdx, cdy) or 1.0
-                                        self.x += (cdx / cd) * (self.speed * FRAME_SCALE)
-                                        self.y += (cdy / cd) * (self.speed * FRAME_SCALE)
-                                        self.stay_in_bounds()
-                                    except Exception:
-                                        pass
-                            else:
-                                self.x = step_x; self.y = step_y; self.stay_in_bounds()
+                    self.move_towards(target, covers)
+                elif dist_to_target < max(12, (desired * 0.5)) and self.role != 'heavy' and not getattr(self,'controlled',False):
+                    # create distance: set temporary retreat target
+                    dx = self.x - target.x; dy = self.y - target.y
+                    dd = math.hypot(dx, dy) or 1.0
+                    retreat_distance = max(40, desired * 0.8)
+                    rx = clamp(self.x + (dx / dd) * retreat_distance, self.radius, SCREEN_W - self.radius)
+                    ry = clamp(self.y + (dy / dd) * retreat_distance, self.radius, SCREEN_H - self.radius)
+                    self.temporary_retreat_target = (rx, ry)
+                    self.temporary_retreat_frames = int(30 * FRAME_SCALE) if FRAME_SCALE>0 else 30
+                    self.try_move_to(self.x + (dx / dd) * (self.speed * 1.5 * FRAME_SCALE), self.y + (dy / dd) * (self.speed * 1.5 * FRAME_SCALE), covers)
                 # if reloading, seek cover while reloading
                 if self.reloading and covers:
                     try:
                         nearest_cover = min(covers, key=lambda c: math.hypot(c.rect.centerx - self.x, c.rect.centery - self.y))
-                        dx = nearest_cover.rect.centerx - self.x
-                        dy = nearest_cover.rect.centery - self.y
+                        dx = nearest_cover.rect.centerx - self.x; dy = nearest_cover.rect.centery - self.y
                         d = math.hypot(dx, dy) or 1.0
-                        self.x += (dx / d) * (self.speed * FRAME_SCALE)
-                        self.y += (dy / d) * (self.speed * FRAME_SCALE)
-                        self.stay_in_bounds()
+                        self.try_move_to(self.x + (dx / d) * (self.speed * FRAME_SCALE), self.y + (dy / d) * (self.speed * FRAME_SCALE), covers)
                     except Exception:
                         pass
 
-    # firing cadence scaled by FRAME_SCALE so higher FPS doesn't make soldiers shoot faster
+        # firing cadence scaled by FRAME_SCALE
         self.reload_counter += FRAME_SCALE
 
-        # handle active reload timer (when reloading)
+        # handle reload timer
         if self.reloading:
             self.reload_timer -= FRAME_SCALE
             if self.reload_timer <= 0:
@@ -379,105 +465,207 @@ class Soldier:
                 self.mag += to_load
                 self.reloading = False
 
-        # medic heals teammates instead of firing
+        # medic heals
         if self.role == 'medic' and self.reload_counter >= self.reload_time:
-            self.reload_counter = 0
             if allies:
-                ally = min([a for a in allies if a is not self and a.hp > 0], key=lambda a: math.hypot(a.x - self.x, a.y - self.y), default=None)
-                if ally and math.hypot(ally.x - self.x, ally.y - self.y) < 100:
-                    ally.hp = min(ally.max_hp, ally.hp + 25)
-                    self.face_expression = 'shooting'
-                    self.speech_text = 'Medic!'
-                    self.speech_timer = 30
+                damaged = [a for a in allies if a is not self and a.hp > 0 and a.hp <= a.max_hp - 10]
+                if damaged:
+                    ally = min(damaged, key=lambda a: math.hypot(a.x - self.x, a.y - self.y))
+                    if math.hypot(ally.x - self.x, ally.y - self.y) < 100:
+                        ally.hp = min(ally.max_hp, ally.hp + 25)
+                        self.face_expression = 'shooting'
+                        self.speech_text = 'Medic!'
+                        self.speech_timer = 30
+                        self.reload_counter = 0
         else:
             if self.reload_counter >= self.reload_time and target:
-                # If we're out of ammo, start reload
                 if self.mag <= 0:
                     if self.reserve > 0 and not self.reloading:
-                        self.reloading = True
-                        self.reload_timer = self.reload_time_frames
+                        self.reloading = True; self.reload_timer = self.reload_time_frames
                 else:
                     did_fire = False
                     if self.role == 'grenadier' and random.random() < 0.25:
                         if self.mag > 0:
-                            grenades.append(Grenade(self.x, self.y, target.x, target.y))
+                            # do not lob grenades through solid cover
+                            if not _line_blocked_by_covers(self.x, self.y, target.x, target.y, covers):
+                                # ensure grenade spawn point isn't inside a cover
+                                if not self.blocked_by_covers(self.x, self.y, covers):
+                                    grenades.append(Grenade(self.x, self.y, target.x, target.y, owner=self))
+                                else:
+                                    # try to nudge out of cover
+                                    self.try_move_to(self.x + (self.speed * FRAME_SCALE), self.y, covers)
+                            else:
+                                # try a minor lateral sidestep to get LOS
+                                self.try_move_to(self.x + (self.speed * FRAME_SCALE) * (1 if random.random()<0.5 else -1), self.y, covers)
                             if sounds and sounds.get('grenade'):
-                                try:
-                                    sounds['grenade'].play()
-                                except Exception:
-                                    pass
-                            self.mag -= 1
-                            did_fire = True
+                                try: play_sound_local(sounds['grenade'])
+                                except Exception: pass
+                            self.mag -= 1; did_fire = True
                         else:
-                            # no mag: start reload if possible
                             if self.reserve > 0 and not self.reloading:
-                                self.reloading = True
-                                self.reload_timer = self.reload_time_frames
-                                self.speech_text = 'RELOADING'
-                                self.speech_timer = 60
-                                self.retreating = True
-                                # immediate small step toward nearest cover if available
+                                self.reloading = True; self.reload_timer = self.reload_time_frames
+                                self.speech_text = 'RELOADING'; self.speech_timer = 60; self.retreating = True
                                 if covers:
                                     try:
                                         nc = min(covers, key=lambda c: math.hypot(c.rect.centerx - self.x, c.rect.centery - self.y))
                                         dx = nc.rect.centerx - self.x; dy = nc.rect.centery - self.y
                                         d = math.hypot(dx, dy) or 1.0
-                                        self.x += (dx / d) * (self.speed * FRAME_SCALE)
-                                        self.y += (dy / d) * (self.speed * FRAME_SCALE)
-                                        self.stay_in_bounds()
-                                    except Exception:
-                                        pass
+                                        self.try_move_to(self.x + (dx / d) * (self.speed * FRAME_SCALE), self.y + (dy / d) * (self.speed * FRAME_SCALE), covers)
+                                    except Exception: pass
                     else:
                         if self.mag > 0:
-                            bdx = self.weapon_length if self.color == (255, 0, 0) else -self.weapon_length
-                            bullets.append(Bullet(self.x + bdx, self.y, target.x, target.y, self.color, damage=self.damage, owner=self))
-                            # try to play a sound if available
-                            try:
-                                if getattr(self, 'weapon_sound', None):
-                                    self.weapon_sound.play()
+                            # do not shoot through cover; require line-of-sight
+                            if not _line_blocked_by_covers(self.x, self.y, target.x, target.y, covers):
+                                bdx = self.weapon_length if self.color == (255,0,0) else -self.weapon_length
+                                spawn_x = self.x + bdx
+                                spawn_y = self.y
+                                if not self.blocked_by_covers(spawn_x, spawn_y, covers):
+                                    bullets.append(Bullet(spawn_x, spawn_y, target.x, target.y, self.color, damage=self.damage, owner=self))
+                                    # play weapon sound for this soldier (prefer weapon_key -> sounds mapping)
+                                    try:
+                                        if sounds is not None:
+                                            s = None
+                                            wk = getattr(self, 'weapon_key', None)
+                                            if wk:
+                                                s = sounds.get(wk)
+                                            if s is None:
+                                                s = (sounds.get('shoot_red') if self.color == (255,0,0) else sounds.get('shoot_blue'))
+                                            # avoid playing explosion/grenade sound as a weapon sound
+                                            if s and s is not sounds.get('explosion') and s is not sounds.get('grenade'):
+                                                play_sound_local(s)
+                                    except Exception:
+                                        pass
                                 else:
-                                    if sounds:
-                                        (sounds.get('shoot_red') if self.color == (255, 0, 0) else sounds.get('shoot_blue')) and (sounds.get('shoot_red') if self.color == (255, 0, 0) else sounds.get('shoot_blue')).play()
-                            except Exception:
-                                pass
-                            self.mag -= 1
-                            did_fire = True
+                                    # weapon muzzle would be inside cover; try a small sidestep
+                                    self.try_move_to(self.x + (self.speed * FRAME_SCALE) * (1 if random.random()<0.5 else -1), self.y, covers)
+                            else:
+                                # attempt small lateral sidestep to acquire LOS
+                                self.try_move_to(self.x + (self.speed * FRAME_SCALE) * (1 if random.random()<0.5 else -1), self.y, covers)
+                                try:
+                                    if sounds is not None:
+                                        s = None
+                                        wk = getattr(self, 'weapon_key', None)
+                                        if wk:
+                                            s = sounds.get(wk)
+                                        if s is None:
+                                            s = (sounds.get('shoot_red') if self.color == (255,0,0) else sounds.get('shoot_blue'))
+                                        if s:
+                                            play_sound_local(s)
+                                except Exception:
+                                    pass
+                            self.mag -= 1; did_fire = True
                         else:
-                            # no mag: start reload if possible
                             if self.reserve > 0 and not self.reloading:
-                                self.reloading = True
-                                self.reload_timer = self.reload_time_frames
-                                self.speech_text = 'RELOADING'
-                                self.speech_timer = 60
-                                self.retreating = True
+                                self.reloading = True; self.reload_timer = self.reload_time_frames
+                                self.speech_text = 'RELOADING'; self.speech_timer = 60; self.retreating = True
                                 if covers:
                                     try:
                                         nc = min(covers, key=lambda c: math.hypot(c.rect.centerx - self.x, c.rect.centery - self.y))
                                         dx = nc.rect.centerx - self.x; dy = nc.rect.centery - self.y
                                         d = math.hypot(dx, dy) or 1.0
-                                        self.x += (dx / d) * (self.speed * FRAME_SCALE)
-                                        self.y += (dy / d) * (self.speed * FRAME_SCALE)
-                                        self.stay_in_bounds()
-                                    except Exception:
-                                        pass
+                                        self.try_move_to(self.x + (dx / d) * (self.speed * FRAME_SCALE), self.y + (dy / d) * (self.speed * FRAME_SCALE), covers)
+                                    except Exception: pass
 
                     if did_fire:
+                        # reset counter and apply small random jitter to next shot interval to reduce perfect overlap
                         self.reload_counter = 0
-                        self.face_expression = 'shooting'
-                        self.speech_text = 'Bang!'
-                        self.speech_timer = 30
-                        self.recoil_timer = 3
+                        # jitter reload_time between 85% and 135% of base
+                        try:
+                            self.reload_time = max(2, int(self.reload_time_base * random.uniform(0.85, 1.35)))
+                        except Exception:
+                            self.reload_time = self.reload_time_base
+                        self.face_expression = 'shooting'; self.speech_text = 'Bang!'; self.speech_timer = 30; self.recoil_timer = 3
+                    else:
+                        # if we had a valid target and enough ammo and the reload counter was sufficient but we still didn't fire,
+                        # log a short debug line (rate-limited) to help locate cases where AI silently stops shooting
+                        try:
+                            if target and self.mag > 0 and not self.reloading and self.reload_counter >= self.reload_time and self._debug_fire_cooldown <= 0:
+                                print(f"[AI DEBUG] {getattr(self,'name', 'AI')} had target at {int(target.x)},{int(target.y)} but didn't fire. role={self.role} mag={self.mag} reload={self.reload_counter:.1f}/{self.reload_time}")
+                                self._debug_fire_cooldown = 120.0
+                        except Exception:
+                            pass
 
         if self.face_expression != 'hit' and self.reload_counter < self.reload_time / 4:
             self.face_expression = 'default'
-        if self.speech_timer > 0:
-            self.speech_timer -= FRAME_SCALE
-        else:
-            self.speech_text = ''
-        if self.recoil_timer > 0:
-            self.recoil_timer -= FRAME_SCALE
-        if self.melee_timer > 0:
-            self.melee_timer -= FRAME_SCALE
+        if self.speech_timer > 0: self.speech_timer -= FRAME_SCALE
+        else: self.speech_text = ''
+        if self.recoil_timer > 0: self.recoil_timer -= FRAME_SCALE
+        if self.melee_timer > 0: self.melee_timer -= FRAME_SCALE
+
+        # debug cooldown countdown
+        if getattr(self, '_debug_fire_cooldown', 0) > 0:
+            self._debug_fire_cooldown = max(0.0, self._debug_fire_cooldown - FRAME_SCALE)
+
+        # make sure soldier isn't stuck inside a cover - push to nearest edge
+        try: self.avoid_covers(covers)
+        except Exception: pass
+
+        # simple stuck detection: if position hasn't changed for many frames, nudge
+        try:
+            if abs(self.x - self._last_pos_check_x) < 0.5 and abs(self.y - self._last_pos_check_y) < 0.5:
+                self._stuck_frames += 1
+            else:
+                self._stuck_frames = 0
+            self._last_pos_check_x = self.x; self._last_pos_check_y = self.y
+            if self._stuck_frames > max(20, int(10 * FRAME_SCALE)):
+                # apply a small random jitter to try to free the pawn
+                jitter_x = random.uniform(-8.0, 8.0)
+                jitter_y = random.uniform(-8.0, 8.0)
+                self.try_move_to(self.x + jitter_x, self.y + jitter_y, covers)
+                self._stuck_frames = 0
+        except Exception:
+            pass
+
+        # Bomb pickup/seek logic for T-side soldiers: if the bomb is dropped (not carried)
+        # T soldiers will try to retrieve it: move towards it if within a seek radius,
+        # and pick up automatically when close enough.
+        try:
+            if bomb is not None and getattr(self, 'side', None) == 'T' and not getattr(self, 'carrying_bomb', False):
+                # if bomb is currently on ground
+                bx = bomb.get('x'); by = bomb.get('y')
+                carried = bomb.get('carried_by')
+                if carried is None and bx is not None and by is not None:
+                    dx = bx - self.x; dy = by - self.y
+                    dist = math.hypot(dx, dy) or 0.001
+                    # if very close, pick up
+                    if dist < 26:
+                        self.carrying_bomb = True
+                        bomb['carried_by'] = self
+                        bomb['x'] = None; bomb['y'] = None
+                    # if within seek distance, move toward bomb (pathfind around covers)
+                    elif dist < 300:
+                        # attempt to move toward bomb but avoid entering covers
+                        try:
+                            self.move_towards(type('P', (), {'x': bx, 'y': by})(), covers)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+    def avoid_covers(self, covers):
+        # if soldier is inside any cover rect, move them to the nearest exterior edge
+        for c in covers:
+            if c.rect.collidepoint(self.x, self.y):
+                left = c.rect.left - self.radius
+                right = c.rect.right + self.radius
+                top = c.rect.top - self.radius
+                bottom = c.rect.bottom + self.radius
+                # compute distances to each candidate exterior x/y
+                dx_left = abs(self.x - left)
+                dx_right = abs(self.x - right)
+                dy_top = abs(self.y - top)
+                dy_bottom = abs(self.y - bottom)
+                # choose smallest movement axis
+                min_dx = min(dx_left, dx_right)
+                min_dy = min(dy_top, dy_bottom)
+                if min_dx < min_dy:
+                    # push horizontally
+                    self.x = left if dx_left < dx_right else right
+                else:
+                    # push vertically
+                    self.y = top if dy_top < dy_bottom else bottom
+                # ensure still in bounds
+                self.stay_in_bounds()
 
     def draw(self, screen):
         sx, sy = int(self.x), int(self.y)
@@ -541,16 +729,52 @@ class Soldier:
             ammo_text = f"{self.mag}/{self.reserve}"
             ammo_s = ammo_font.render(ammo_text, True, (255, 255, 0))
             ammo_x = sx - ammo_s.get_width() // 2
-            ammo_y = sy - 33
+            # place ammo display below the pawn to avoid overlap with name
+            ammo_y = sy + self.radius + 6
             screen.blit(ammo_s, (ammo_x, ammo_y))
         except Exception:
             pass
 
+        # draw name above pawn (slightly above the sprite)
+        try:
+            name_font = pygame.font.SysFont(None, 14)
+            name_s = name_font.render(str(getattr(self, 'name', '')), True, (230,230,230))
+            nx = sx - name_s.get_width() // 2
+            ny = sy - 30
+            screen.blit(name_s, (nx, ny))
+        except Exception:
+            pass
+
+        # draw speech text above the name so it's visually on top
         if self.speech_text:
-            font = pygame.font.SysFont(None, 16)
-            text_surf = font.render(self.speech_text, True, (255, 255, 255))
-            tx = sx - text_surf.get_width() // 2
-            ty = sy - 48
-            pygame.draw.rect(screen, (0, 0, 0), (tx - 3, ty - 2, text_surf.get_width() + 6, text_surf.get_height() + 4))
-            screen.blit(text_surf, (tx, ty))
+            try:
+                font = pygame.font.SysFont(None, 16)
+                text_surf = font.render(self.speech_text, True, (255, 255, 255))
+                tx = sx - text_surf.get_width() // 2
+                ty = sy - 52
+                pygame.draw.rect(screen, (0, 0, 0), (tx - 3, ty - 2, text_surf.get_width() + 6, text_surf.get_height() + 4))
+                screen.blit(text_surf, (tx, ty))
+            except Exception:
+                pass
+
+        # debug: small dot showing ready-to-fire (helps diagnose AI that should fire but doesn't)
+        try:
+            if getattr(self, 'mag', 0) > 0 and getattr(self, 'reload_counter', 0) >= getattr(self, 'reload_time', 1):
+                pygame.draw.circle(screen, (0, 220, 0), (sx, sy - self.radius - 6), 3)
+        except Exception:
+            pass
+
+        # draw side label near pawn (T or CT) if present
+        try:
+            side = getattr(self, 'side', None)
+            if side:
+                font = pygame.font.SysFont(None, 14)
+                side_text = 'CT' if side == 'CT' else 'T'
+                s_surf = font.render(side_text, True, (200,200,255) if side_text=='CT' else (200,100,100))
+                # place label to lower-left of the pawn
+                sx_lbl = sx - self.radius - s_surf.get_width() - 4
+                sy_lbl = sy + self.radius - 6
+                screen.blit(s_surf, (sx_lbl, sy_lbl))
+        except Exception:
+            pass
 
